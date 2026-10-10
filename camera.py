@@ -1,3 +1,4 @@
+import os
 import cv2
 import time
 from collections import Counter
@@ -13,6 +14,7 @@ from config import (
     FIRST_LINE_LOCK,
     LINE_CROSSING_MIN_MOVEMENT,
     OCR_AFTER_FIRST_LINE_ONLY,
+    SHOW_CAMERA_WINDOW,
 )
 
 from tracker import track_bus
@@ -2492,7 +2494,7 @@ latest_frame = None
 frame_lock = threading.Lock()
 
 
-async def camera_websocket(websocket):
+async def camera_websocket(websocket, path=None):
 
     try:
 
@@ -2551,35 +2553,103 @@ def start_camera():
     global line_selection_done
 
     # ========================================================
-    # WEBSOCKET SERVER
+    # CAMERA STREAM SERVER (HTTP MJPEG & WEBSOCKET)
     # ========================================================
 
-    async def start_websocket_server():
+    async def handle_camera_client(reader, writer):
+        try:
+            header_bytes = await reader.readuntil(b"\r\n\r\n")
+            header_text = header_bytes.decode('utf-8', errors='ignore')
+            headers = {}
+            lines = header_text.split("\r\n")
+            for line in lines[1:]:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
 
-        server = await websockets.serve(
-            camera_websocket,
-            "0.0.0.0",
-            8000
-        )
+            if headers.get("upgrade", "").lower() == "websocket":
+                key = headers.get("sec-websocket-key", "")
+                import base64, hashlib
+                magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                accept = base64.b64encode(hashlib.sha1((key + magic).encode()).digest()).decode()
+                resp = (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                )
+                writer.write(resp.encode())
+                await writer.drain()
 
-        print(
-            "Camera WebSocket server started "
-            "on ws://localhost:8000/ws/camera"
-        )
+                while not writer.is_closing():
+                    with frame_lock:
+                        frame = latest_frame
+                    if frame is not None:
+                        ret, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                        if ret:
+                            payload = buf.tobytes()
+                            length = len(payload)
+                            header = bytearray([0x82])
+                            if length <= 125:
+                                header.append(length)
+                            elif length <= 65535:
+                                header.append(126)
+                                header.extend(length.to_bytes(2, 'big'))
+                            else:
+                                header.append(127)
+                                header.extend(length.to_bytes(8, 'big'))
+                            writer.write(header + payload)
+                            await writer.drain()
+                    await asyncio.sleep(0.07)
+            else:
+                resp = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Cache-Control: no-cache, private\r\n"
+                    "Pragma: no-cache\r\n\r\n"
+                )
+                writer.write(resp.encode())
+                await writer.drain()
 
-        await server.wait_closed()
+                while not writer.is_closing():
+                    with frame_lock:
+                        frame = latest_frame
+                    if frame is not None:
+                        ret, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                        if ret:
+                            payload = buf.tobytes()
+                            chunk = (
+                                b"--frame\r\n"
+                                b"Content-Type: image/jpeg\r\n"
+                                b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" +
+                                payload + b"\r\n"
+                            )
+                            writer.write(chunk)
+                            await writer.drain()
+                    await asyncio.sleep(0.07)
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
-    def run_websocket_server():
+    async def start_camera_server():
+        server = await asyncio.start_server(handle_camera_client, "0.0.0.0", 8000)
+        print("Camera Server (HTTP MJPEG Video & WebSocket) started on http://camera.zynix.us/ws/camera (port 8000)")
+        async with server:
+            await server.serve_forever()
 
-        asyncio.run(
-            start_websocket_server()
-        )
+    def run_camera_server():
+        asyncio.run(start_camera_server())
 
     websocket_thread = threading.Thread(
-        target=run_websocket_server,
+        target=run_camera_server,
         daemon=True
     )
-
     websocket_thread.start()
 
     # ========================================================
@@ -2668,14 +2738,18 @@ def start_camera():
     # LINE SELECTOR
     # ========================================================
 
-    cv2.namedWindow(
-        "IN/OUT X - Live Camera"
-    )
+    if SHOW_CAMERA_WINDOW and os.environ.get("DISPLAY"):
+        try:
+            cv2.namedWindow(
+                "IN/OUT X - Live Camera"
+            )
 
-    cv2.setMouseCallback(
-        "IN/OUT X - Live Camera",
-        line_mouse_callback
-    )
+            cv2.setMouseCallback(
+                "IN/OUT X - Live Camera",
+                line_mouse_callback
+            )
+        except Exception:
+            pass
 
     # ========================================================
     # MAIN LOOP
@@ -4256,23 +4330,25 @@ def start_camera():
             )
 
         # ========================================================
-        # DISPLAY
+        # DISPLAY & KEYBOARD
         # ========================================================
 
-        cv2.imshow(
-            "IN/OUT X - Live Camera",
-            annotated_frame
-        )
-
-        # ========================================================
-        # KEYBOARD
-        # ========================================================
-
-        key = (
-            cv2.waitKey(1)
-            &
-            0xFF
-        )
+        key = -1
+        if SHOW_CAMERA_WINDOW and os.environ.get("DISPLAY"):
+            try:
+                cv2.imshow(
+                    "IN/OUT X - Live Camera",
+                    annotated_frame
+                )
+                key = (
+                    cv2.waitKey(1)
+                    &
+                    0xFF
+                )
+            except Exception:
+                key = -1
+        else:
+            time.sleep(0.001)
 
         # ========================================================
         # RESET LINES
@@ -4327,7 +4403,11 @@ def start_camera():
 
     camera.release()
 
-    cv2.destroyAllWindows()
+    if SHOW_CAMERA_WINDOW and os.environ.get("DISPLAY"):
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
     print()
     print("=" * 60)

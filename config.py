@@ -13,10 +13,11 @@ VERSION = "1.0"
 # ============================================================
 # CAMERA CONFIGURATION
 # ============================================================
-
-CAMERA_SOURCE =0
+CAMERA_SOURCE = "rtsp://krct:Krct%403701@192.168.77.228:554/Streaming/channels/101"
 CAMERA_ID = "Gate_01"
 GATE_NAME = "Main Gate"
+SHOW_CAMERA_WINDOW = True  # Set to False to run headless (no OpenCV display window)
+
 
 
 # ============================================================
